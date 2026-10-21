@@ -10,25 +10,33 @@ from __future__ import annotations
 import argparse
 import asyncio
 
+import httpx
 from a2a.client import ClientConfig, create_client
 from a2a.helpers import get_stream_response_text
 from a2a.helpers.proto_helpers import new_text_message
 from a2a.types import Role, SendMessageRequest
 
 
-async def main(url: str, text: str) -> None:
-    # Resolves /.well-known/agent-card.json and picks the transport (JSON-RPC).
-    client = await create_client(url, ClientConfig(streaming=True))
+# httpx's default timeout (5 s) is too short for a local model, especially on
+# a cold start while Ollama loads it into memory.
+REQUEST_TIMEOUT = 180.0
 
-    async with client:
-        print(f'> {text}')
-        request = SendMessageRequest(
-            message=new_text_message(text, role=Role.ROLE_USER)
+
+async def main(url: str, text: str) -> None:
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as http:
+        # Resolves /.well-known/agent-card.json and picks the transport.
+        client = await create_client(
+            url, ClientConfig(streaming=True, httpx_client=http)
         )
-        async for response in client.send_message(request):
-            kind = response.WhichOneof('payload') or '?'
-            reply = get_stream_response_text(response)
-            print(f'[{kind}] {reply}' if reply else f'[{kind}]')
+        async with client:
+            print(f'> {text}')
+            request = SendMessageRequest(
+                message=new_text_message(text, role=Role.ROLE_USER)
+            )
+            async for response in client.send_message(request):
+                kind = response.WhichOneof('payload') or '?'
+                reply = get_stream_response_text(response)
+                print(f'[{kind}] {reply}' if reply else f'[{kind}]')
 
 
 if __name__ == '__main__':

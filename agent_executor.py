@@ -161,6 +161,7 @@ class DelegatingAgentExecutor(ReplyExecutor):
         self._reviewer = reviewer
         self._review_prompt = review_prompt
         self._peer_client = None
+        self._peer_http = None
 
     async def reply(self, user_text: str, context: RequestContext) -> str:
         peer_answer = await self._ask_peer(user_text)
@@ -179,8 +180,12 @@ class DelegatingAgentExecutor(ReplyExecutor):
     async def _ask_peer(self, user_text: str) -> str:
         if self._peer_client is None:
             # Resolves the peer's Agent Card and picks the transport.
+            # httpx's default timeout (5 s) is too short for a peer backed by
+            # a local model, so the peer client gets its own.
+            self._peer_http = httpx.AsyncClient(timeout=180.0)
             self._peer_client = await create_client(
-                self._peer_url, ClientConfig(streaming=True)
+                self._peer_url,
+                ClientConfig(streaming=True, httpx_client=self._peer_http),
             )
 
         request = SendMessageRequest(
@@ -196,6 +201,8 @@ class DelegatingAgentExecutor(ReplyExecutor):
     async def aclose(self) -> None:
         if self._peer_client is not None:
             await self._peer_client.close()
+        if self._peer_http is not None:
+            await self._peer_http.aclose()
         if self._reviewer is not None:
             await self._reviewer.aclose()
 
