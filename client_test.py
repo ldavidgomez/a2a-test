@@ -9,8 +9,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import sys
 
-import httpx
+try:  # httpx solo está en el venv del proyecto: el aviso apunta al fix
+    import httpx  # noqa: F401
+except ModuleNotFoundError:
+    raise SystemExit(
+        'Faltan dependencias: este script necesita el venv del proyecto. '
+        'Ejecuta:\n  .venv\\Scripts\\python.exe '
+        + ' '.join(sys.argv)
+        + '\no activa el venv antes: .venv\\Scripts\\Activate.ps1'
+    )
+
 from a2a.client import ClientConfig, create_client
 from a2a.helpers import get_stream_response_text
 from a2a.helpers.proto_helpers import new_text_message

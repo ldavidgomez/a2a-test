@@ -26,6 +26,17 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import sys
+
+try:  # httpx solo está en el venv del proyecto: el aviso apunta al fix
+    import httpx  # noqa: F401
+except ModuleNotFoundError:
+    raise SystemExit(
+        'Faltan dependencias: este script necesita el venv del proyecto. '
+        'Ejecuta:\n  .venv\\Scripts\\python.exe '
+        + ' '.join(sys.argv)
+        + '\no activa el venv antes: .venv\\Scripts\\Activate.ps1'
+    )
 
 from shop_client import a2a_get_task, a2a_send, call_mcp_tool
 from shop_stack import Stack
@@ -191,7 +202,10 @@ async def main() -> None:
                         help='do not wipe data/ before starting')
     args = parser.parse_args()
 
-    llm_config = load_config(args.llm_config)
+    try:
+        llm_config = load_config(args.llm_config)
+    except ValueError as exc:
+        raise SystemExit(f'ERROR de configuración: {exc}') from None
     llm = args.llm or resolve_provider_name(None, llm_config)
     acts = {part for part in args.acts.split(',') if part}
 

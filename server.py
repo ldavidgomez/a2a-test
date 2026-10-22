@@ -10,6 +10,17 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import sys
+
+try:  # httpx solo está en el venv del proyecto: el aviso apunta al fix
+    import httpx  # noqa: F401
+except ModuleNotFoundError:
+    raise SystemExit(
+        'Faltan dependencias: este script necesita el venv del proyecto. '
+        'Ejecuta:\n  .venv\\Scripts\\python.exe '
+        + ' '.join(sys.argv)
+        + '\no activa el venv antes: .venv\\Scripts\\Activate.ps1'
+    )
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -155,7 +166,10 @@ def build_executor(args: argparse.Namespace):
         if not args.peer:
             raise SystemExit('sales mode needs --peer http://host:port '
                              '(the stock agent URL)')
-        llm_config = load_config(args.llm_config)
+        try:
+            llm_config = load_config(args.llm_config)
+        except ValueError as exc:
+            raise SystemExit(f'ERROR de configuración: {exc}') from None
         provider_name = resolve_provider_name(args.llm, llm_config)
         llm = build_llm_client(
             provider_name,
