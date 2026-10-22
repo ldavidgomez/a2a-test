@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -432,62 +433,76 @@ class Shop:
 
 
 def build_server(shop: Shop) -> FastMCP:
-    """Wires the Shop into FastMCP tools. Writes share one asyncio lock."""
+    """Wires the Shop into FastMCP tools. Writes share one asyncio lock.
+
+    Every call is logged to ``mcp.log`` as ``-> tool {args}`` /
+    ``<- tool {result}`` so the whole A2A+MCP flow can be traced hop by hop.
+    """
     mcp = FastMCP('shop', stateless_http=True, json_response=True)
     lock = asyncio.Lock()
 
-    def unlock_wrap(write_fn):
-        async def wrapper(*args, **kwargs):
-            async with lock:  # serialise writes within this process
-                return await asyncio.to_thread(write_fn, *args, **kwargs)
-        return wrapper
+    def mcp_tool(name):
+        """Registers a tool, logging arguments and results."""
+        def decorate(fn):
+            @functools.wraps(fn)
+            async def wrapper(*args, **kwargs):
+                logger.info('-> %s %s', name, json.dumps(
+                    kwargs or {}, ensure_ascii=False, default=str)[:200])
+                result = await fn(*args, **kwargs)
+                logger.info('<- %s %s', name, json.dumps(
+                    result, ensure_ascii=False, default=str)[:300])
+                return result
+            mcp.tool(name=name)(wrapper)
+            return wrapper
+        return decorate
 
-    @mcp.tool()
+    @mcp_tool('search_stock')
     async def search_stock(query: str = '', category: str = '') -> dict:
         """Busca productos; query coincide con nombre/tags/categoría/código."""
-        return shop.search_stock(query, category)
+        return shop.search_stock(query, category)  # lectura rápida (SQLite local)
 
-    @mcp.tool()
+    @mcp_tool('get_product')
     async def get_product(code: str) -> dict:
         """Devuelve un producto por código."""
         return shop.get_product(code)
 
-    reserve = unlock_wrap(shop.reserve_stock)
-
-    @mcp.tool()
-    async def reserve_stock(code: str, qty: int, idempotency_key: str) -> dict:
+    @mcp_tool('reserve_stock')
+    async def reserve_stock(code: str, qty: int,
+                            idempotency_key: str) -> dict:
         """Reserva unidades de forma atómica e idempotente."""
-        return await reserve(code, qty, idempotency_key)
+        async with lock:
+            return await asyncio.to_thread(
+                shop.reserve_stock, code, qty, idempotency_key)
 
-    @mcp.tool()
+    @mcp_tool('get_reservation')
     async def get_reservation(reservation_id: str) -> dict:
         """Devuelve el estado de una reserva (CONFIRMED/CONSUMED/EXPIRED)."""
         return shop.get_reservation(reservation_id)
 
-    create = unlock_wrap(shop.create_order)
-
-    @mcp.tool()
+    @mcp_tool('create_order')
     async def create_order(reservation_id: str, customer: str,
-                          idempotency_key: str) -> dict:
+                           idempotency_key: str) -> dict:
         """Convierte una reserva confirmada en pedido (atómico e idempotente)."""
-        return await create(reservation_id, customer, idempotency_key)
+        async with lock:
+            return await asyncio.to_thread(
+                shop.create_order, reservation_id, customer, idempotency_key)
 
-    @mcp.tool()
+    @mcp_tool('get_order')
     async def get_order(order_id: str) -> dict:
         """Devuelve un pedido por su identificador."""
         return shop.get_order(order_id)
 
-    @mcp.tool()
+    @mcp_tool('set_stock')
     async def set_stock(code: str, units: int) -> dict:
         """[admin] Fija el stock de un producto (para pruebas)."""
         return shop.set_stock(code, units)
 
-    @mcp.tool()
+    @mcp_tool('admin_stats')
     async def admin_stats() -> dict:
         """[admin] Contadores de reservas/pedidos y stock por código."""
         return shop.admin_stats()
 
-    @mcp.tool()
+    @mcp_tool('reset_shop')
     async def reset_shop() -> dict:
         """[admin] Borra reservas y pedidos, y restaura el stock inicial."""
         async with lock:
