@@ -295,6 +295,102 @@ Reservations expire after 90 s (`DEFAULT_RESERVATION_TTL_SECONDS`), so a
 recovered-but-expired attempt is rejected with `RESERVA_CADUCADA` and the
 next `comprar` starts a new attempt with a fresh idempotency key.
 
+## 5. How to test it (checklist)
+
+Everything below uses only the venv (no sqlite3 CLI needed) and exits with
+`0` on success / `1` on failure, so any of it fits a CI job. `data/` is
+wiped automatically unless `--keep-data`.
+
+### Quick smoke — one command, whole story
+
+```powershell
+.\.venv\Scripts\python.exe demo_purchase.py
+```
+
+Runs acts 1–3 and ends with the summary (`ACTO 1: OK`, `ACTO 2: OK`,
+`ACTO 3 (pruebas): PASS`). What each act shows, in one table:
+
+| Act | Proves | PASS looks like |
+| --- | --- | --- |
+| 1 · camino feliz | steps 1–6: A2A delegation ventas→stock, MCP query, `input-required` selection resumed with `taskId`, reserve + order in one task | `[PASS] la búsqueda deja la tarea en input-required`, `pedido creado: PED-…` |
+| 2 · drill de reinicio | durability: crash between reservation and order, task stays `WORKING` in SQLite, next reply with the same `taskId` completes **that same task** | `tasks/get tras el reinicio -> TASK_STATE_WORKING` → `-> TASK_STATE_COMPLETED` |
+| 3 · prueba de concurrencia | atomicity of the last unit: 1 winner, 7 clean business rejections, stock 0 and never negative | `[PASS] exactamente 1 pedido confirmado`, `[PASS] ninguna tarea termina en estado de error` |
+| 3 · prueba de idempotencia | repeats collapse: same order on «comprar» replay, same reservation on repeated `reserve_stock`, same order on repeated `create_order` | `[PASS] repetir «comprar» devuelve el MISMO pedido`, `[PASS] BD sin cambios` |
+
+Run a single act with `--acts 1` / `--acts 2` / `--acts 3`, and add
+`--llm glm` o `--llm ollama` to run the same checks with decorated prose
+(the LLM is best-effort: unreachable → templates, tests unaffected).
+
+### The critical tests, standalone
+
+```powershell
+.\.venv\Scripts\python.exe test_concurrency.py            # +--sessions 16, --no-boot
+.\.venv\Scripts\python.exe test_idempotency.py           # --no-boot to reuse a running stack
+```
+
+Each prints its `[PASS]`/`[FAIL]` lines and ends with
+`RESULTADO: ✔` / `✘`. Each boots a **fresh** stack (reset inventory),
+so they can run repeatedly in any order.
+
+### By hand, while the stack runs
+
+Boot it once (three windows from section 4 or the one-shot Python):
+
+```powershell
+.\.venv\Scripts\python.exe client_purchase.py "busco un teclado"
+.\.venv\Scripts\python.exe client_purchase.py --task <taskId> --context <contextId> "elijo 1"
+.\.venv\Scripts\python.exe client_purchase.py --context <contextId> "comprar"
+.\.venv\Scripts\python.exe client_purchase.py --context <contextId> "estado"
+.\.venv\Scripts\python.exe client_purchase.py --interactive
+```
+
+Scenarios worth typing once:
+
+- **Business rejection ≠ failure**: `busco el teclado ergonómico` → `elijo 1` →
+  `comprar` — KD-OUT-04 has 0 units, so the task **completes** with a
+  `SIN_STOCK` rejection artifact (state shown before the data line).
+- **Free text** (`"¿qué sabes hacer?"`) hits the chat handler — GLM-5-3 forms
+  the guidance when `--llm` is configured, templates otherwise.
+- **Everything is durable**: `--get-task <id>` works after killing and
+  relaunching both agents (walk the restart drill from section 4).
+
+### Inspecting what the processes actually did
+
+Every process logs to `data/logs/` (`mcp.log`, `stock.log`, `sales.log`). The
+A2A conversations are visible there — the proof that ventas really calls
+stock over the protocol (not in-process) is the traffic in `stock.log` when
+ventas runs:
+
+```text
+[uvicorn] ... "GET /.well-known/agent-card.json HTTP/1.1" 200
+[uvicorn] ... "POST / HTTP/1.1" 200 OK                      <- sales -> stock
+```
+
+And the durable state is plain SQLite, readable with the venv itself:
+
+```powershell
+# inventory, reservations and orders after a run
+.\.venv\Scripts\python.exe -c "import sqlite3; \
+  c = sqlite3.connect('data/shop.db'); \
+  print(c.execute('select code, stock from products').fetchall()); \
+  print(c.execute('select id, idem_key, status from reservations').fetchall()); \
+  print(c.execute('select id, reservation_id from orders').fetchall())"
+
+# A2A tasks persisted by the agents (minus the stack's stored blobs)
+.\.venv\Scripts\python.exe -c "import sqlite3; \
+  c = sqlite3.connect('data/tasks_sales.db'); \
+  print(c.execute('select id, context_id from tasks').fetchall())"
+```
+
+Sanity checks you should see there after the tests: only the winner of the
+last-unit race has a reservation row for `KD-LAST-03` (a `SIN_STOCK`
+rejection leaves no row), `stock` is 0 for it after the concurrency test,
+and each replayed idempotency key maps to exactly one row — never two —
+which is the whole point of the idempotency drill.
+
+Total reset for a clean slate: delete `data/` (or rerun `demo_purchase.py`,
+which wipes it unless told otherwise).
+
 ## How the pieces fit
 
 1. The client fetches `/.well-known/agent-card.json` and picks the transport (JSON-RPC here) from `supportedInterfaces`.
