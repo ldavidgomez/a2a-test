@@ -144,7 +144,10 @@ Notes when both agents share one Ollama:
 | `--mcp-url` | `http://127.0.0.1:9996` | Shop MCP server (used by `sales`/`stock`) |
 | `--task-db` | `data/tasks_<mode>.db` ¹ | A2A task store: SQLite for `sales`/`stock`, in memory otherwise |
 | `--sales-db` | `data/sales.db` | Durable sales sessions (`sales` mode) |
-| `--llm` | `glm` if `GLM_API_KEY` set | `glm` (GLM-5-3 decorates answers, needs `GLM_API_KEY`), `ollama` (local model) or `none` (deterministic templates) |
+| `--llm` | `AGENT_LLM` > file `default` > `glm` if key set > `none` | `none`, `glm`, `ollama` or **any entry name in `llm_config.json`**: decorates answers via an OpenAI-compatible endpoint |
+| `--llm-model` | per provider | Model name (overrides the built-in/entry value) |
+| `--llm-base-url` | per provider | OpenAI-compatible base URL (overrides the built-in/entry value) |
+| `--llm-config` | `llm_config.json` | JSON with a `"providers"` section naming extra LLM endpoints |
 | `--pause-after` | — | Crash drill: `reserve` = sleep between reservation and order |
 | `--reset` | — | Delete the task/session DB files before starting |
 
@@ -225,6 +228,9 @@ $env:GLM_API_KEY = "..."
 
 # with a local Ollama model instead
 .\.venv\Scripts\python.exe demo_purchase.py --llm ollama
+
+# with an endpoint declared in llm_config.json (see below)
+.\.venv\Scripts\python.exe demo_purchase.py --llm glm-zhipu --llm-config llm_config.json
 ```
 
 It runs three acts — happy path, crash/restart drill and the two critical
@@ -232,6 +238,40 @@ tests — with `[PASS]`/`[FAIL]` verdicts and a summary. All process logs go
 to `data/logs/`. The LLM only rewrites deterministic templates (codes,
 prices and IDs may not change); if it is unreachable the templates are used
 and the demo still passes, so the tests are reproducible.
+
+### The providers file (`--llm-config`)
+
+Beyond the built-ins (`glm`, `ollama`, `none`), any OpenAI-compatible
+endpoint can be declared in a JSON file — default path `llm_config.json`
+(overridable with `--llm-config` or env `A2A_LLM_CONFIG`; see
+[`llm_config.example.json`](llm_config.example.json),
+which is also the shape to copy):
+
+```json
+{
+  "default": "glm",
+  "providers": {
+    "glm":       { "base_url": "https://api.z.ai/api/paas/v4",
+                    "model": "glm-5-3", "api_key_env": "GLM_API_KEY" },
+    "glm-zhipu": { "base_url": "https://open.bigmodel.cn/api/paas/v4",
+                    "model": "glm-5-3", "api_key_env": "ZHIPU_API_KEY" },
+    "ollama":    { "base_url": "http://localhost:11434/v1",
+                    "model": "llama3.2" }
+  }
+}
+```
+
+- Each entry needs `base_url` + `model`; the key comes from inline
+  `api_key` (the file is gitignored) or from the env var named in
+  `api_key_env`. An entry whose `api_key_env` is not set is disabled and
+  ventas falls back to templates.
+- Select one with `--llm <name>` (any entry name). Which provider is used
+  when nothing is given: `AGENT_LLM` env > the file's `default` > `glm` if
+  `GLM_API_KEY` is set > `none`.
+- `--llm-model` / `--llm-base-url` still override the entry, and unknown
+  names fail with the list of available ones.
+- Every entry speaks `POST {base_url}/chat/completions` — that covers
+  GLM (z.ai/Zhipu), Ollama's `/v1`, vLLM, LM Studio, etc.
 
 ### Manual run (three windows + client)
 
