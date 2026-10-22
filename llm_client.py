@@ -70,9 +70,55 @@ def _clean_base_url(url: str) -> str:
 # ----------------------------------------------------------------------
 # providers file
 # ----------------------------------------------------------------------
-def load_config(path: str | None) -> dict:
-    """Reads the providers JSON. Missing file -> {}; malformed -> ValueError.
+def _strip_jsonc_comments(text: str) -> str:
+    """Removes // and /* */ comments; string-aware (URLs keep their //)."""
+    out: list[str] = []
+    index = 0
+    length = len(text)
+    in_string = False
+    while index < length:
+        char = text[index]
+        if in_string:
+            out.append(char)
+            if char == '\\' and index + 1 < length:
+                out.append(text[index + 1])
+                index += 2
+                continue
+            if char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            out.append(char)
+            index += 1
+            continue
+        if char == '/' and index + 1 < length:
+            nxt = text[index + 1]
+            if nxt == '/':  # line comment
+                index += 2
+                while index < length and text[index] != '\n':
+                    index += 1
+                continue
+            if nxt == '*':  # block comment
+                index += 2
+                while (index + 1 < length and not (
+                    text[index] == '*' and text[index + 1] == '/'
+                )):
+                    index += 1
+                index += 2
+                continue
+        out.append(char)
+        index += 1
+    return ''.join(out)
 
+
+def load_config(path: str | None) -> dict:
+    """Reads the providers JSON(C). Missing file -> {}; malformed -> ValueError.
+
+    JSONC tolerance: ``//`` line comments and ``/* */`` blocks are ignored
+    (handy to disable entries while experimenting), but they never swallow
+    ``//`` inside strings such as ``https://...``.
     Accepted shape: ``{"default": "<name>", "providers": {name: entry}}``
     plus optional extra keys (kept for forward compatibility).
     """
@@ -80,11 +126,13 @@ def load_config(path: str | None) -> dict:
         return {}
     try:
         with open(path, encoding='utf-8') as handle:
-            config = json.load(handle)
+            config = json.loads(_strip_jsonc_comments(handle.read()))
     except FileNotFoundError:
         return {}
     except json.JSONDecodeError as exc:
-        raise ValueError(f'fichero de proveedores inválido ({path}): {exc}') from exc
+        raise ValueError(
+            f'fichero de proveedores inválido ({path}): {exc}'
+        ) from exc
 
     if not isinstance(config, dict):
         raise ValueError(f'fichero de proveedores inválido ({path}): se esperaba un objeto JSON')
