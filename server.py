@@ -171,13 +171,16 @@ def build_executor(args: argparse.Namespace):
         except ValueError as exc:
             raise SystemExit(f'ERROR de configuración: {exc}') from None
         provider_name = resolve_provider_name(args.llm, llm_config)
-        llm = build_llm_client(
-            provider_name,
-            model=args.llm_model,
-            base_url=args.llm_base_url,
-            config_path=args.llm_config,
-            ollama_url=args.ollama_url,
-        )
+        try:
+            llm = build_llm_client(
+                provider_name,
+                model=args.llm_model,
+                base_url=args.llm_base_url,
+                config_path=args.llm_config,
+                ollama_url=args.ollama_url,
+            )
+        except ValueError as exc:
+            raise SystemExit(f'ERROR de configuración: {exc}') from None
         logger.info(
             '[sales] LLM: %s',
             'ninguno (plantillas deterministas)' if llm is None

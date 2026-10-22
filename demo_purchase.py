@@ -40,7 +40,7 @@ except ModuleNotFoundError:
 
 from shop_client import a2a_get_task, a2a_send, call_mcp_tool
 from shop_stack import Stack
-from llm_client import load_config, resolve_provider_name
+from llm_client import load_config, resolve_provider_name, validate_provider
 
 import test_concurrency
 import test_idempotency
@@ -204,9 +204,12 @@ async def main() -> None:
 
     try:
         llm_config = load_config(args.llm_config)
+        llm = args.llm or resolve_provider_name(None, llm_config)
+        # Fail fast: an unknown provider would kill the sales subprocess at
+        # startup and surface as an unhelpful 30 s timeout in stack.start().
+        validate_provider(llm, args.llm_config)
     except ValueError as exc:
         raise SystemExit(f'ERROR de configuración: {exc}') from None
-    llm = args.llm or resolve_provider_name(None, llm_config)
     acts = {part for part in args.acts.split(',') if part}
 
     print('PoC compra de teclados · A2A (ventas <-> stock) + MCP (tienda)')

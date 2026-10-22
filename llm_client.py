@@ -159,6 +159,33 @@ def resolve_provider_name(explicit: str | None, config: dict) -> str:
     return 'glm' if os.getenv('GLM_API_KEY') else 'none'
 
 
+def available_providers(config: dict) -> list[str]:
+    """Every selectable name: built-ins + file entries (deduplicated)."""
+    return list(dict.fromkeys(
+        ['none', 'glm', 'ollama'] + sorted((config.get('providers') or {}).keys())
+    ))
+
+
+def validate_provider(name: str, config_path: str | None = None) -> None:
+    """Checks the name resolves to a real provider; no client is built.
+
+    Raises ValueError (listing what exists) so the demo can fail fast
+    before spawning any process.
+    """
+    config = load_config(config_path)
+    resolved = resolve_provider_name(name, config)
+    if (
+        resolved == 'none'
+        or resolved in ('glm', 'ollama')
+        or resolved in (config.get('providers') or {})
+    ):
+        return
+    raise ValueError(
+        f'proveedor LLM desconocido "{resolved}". Disponibles: '
+        f'{", ".join(available_providers(config))}'
+    )
+
+
 def _from_entry(
     name: str, entry: dict, config_path: str | None,
     model: str | None, base_url: str | None, api_key: str | None,
@@ -243,10 +270,7 @@ def build_llm_client(
             base_url=base_url or f'{ollama_url.rstrip("/")}/v1',
         )
 
-    available = list(dict.fromkeys(
-        ['none', 'glm', 'ollama']
-        + sorted((config.get('providers') or {}).keys())
-    ))
+    available = available_providers(config)
     raise ValueError(
         f'proveedor LLM desconocido "{name}". Disponibles: '
         f'{", ".join(available)}'

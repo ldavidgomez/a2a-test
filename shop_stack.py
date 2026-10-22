@@ -70,6 +70,7 @@ class Stack:
         self.log_prefix = log_prefix
         self._processes: dict[str, subprocess.Popen] = {}
         self._log_files: list = []
+        self._log_paths: dict[str, str] = {}
         os.makedirs(LOG_DIR, exist_ok=True)
 
     # -- paths ----------------------------------------------------------
@@ -90,7 +91,9 @@ class Stack:
         log_path = os.path.join(LOG_DIR, log_name)
         log_file = open(log_path, 'a', encoding='utf-8')
         self._log_files.append(log_file)
+        self._log_paths[name] = log_path
         env = {**os.environ, 'PYTHONUTF8': '1', 'PYTHONIOENCODING': 'utf-8'}
+
         proc = subprocess.Popen(
             [sys.executable, '-u', *args],
             cwd=ROOT,
@@ -103,6 +106,45 @@ class Stack:
         print(f'{self.log_prefix}[stack] {name} pid={proc.pid} '
               f'-> {log_path}')
         return proc
+
+    # -- startup diagnostics --------------------------------------------
+    def _tail(self, name: str, lines: int = 12) -> str:
+        """Last lines of a process log (best effort, never raises)."""
+        path = self._log_paths.get(name)
+        try:
+            with open(path, encoding='utf-8', errors='replace') as handle:
+                return '\n'.join(handle.read().splitlines()[-lines:])
+        except OSError:
+            return ''
+
+    def _raise_startup(self, name: str, reason: str) -> None:
+        """Distinguishes 'it died' from 'it hangs', with the log tail."""
+        proc = self._processes.get(name)
+        tail = self._tail(name)
+        suffix = (
+            f'\n--- últimas líneas de {self._log_paths.get(name)} ---\n{tail}'
+            if tail else ''
+        )
+        if proc is not None and proc.poll() is not None:
+            raise RuntimeError(
+                f'[{name}] el proceso murió durante el arranque '
+                f'(código de salida {proc.returncode}){suffix}'
+            )
+        raise TimeoutError(f'[{name}] {reason}{suffix}')
+
+    def _check_alive(self, name: str) -> None:
+        proc = self._processes.get(name)
+        if proc is not None and proc.poll() is not None:
+            self._raise_startup(name, 'no llegó a arrancar')
+
+    def _wait_port(self, name: str, port: int, timeout: float = 30.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self._check_alive(name)
+            if not _free(port):
+                return
+            time.sleep(0.2)
+        self._raise_startup(name, f'puerto {port} nunca se abrió')
 
     def _sales_args(self, extra: list[str] | None = None) -> list[str]:
         args = [
@@ -125,7 +167,7 @@ class Stack:
             'mcp', ['shop_mcp.py', '--port', str(self.mcp_port)],
             'mcp.log',
         )
-        wait_port(self.mcp_port)
+        self._wait_port('mcp', self.mcp_port)
 
         self._spawn(
             'stock',
@@ -133,16 +175,17 @@ class Stack:
              '--name', 'Agente de Stock'],
             'stock.log',
         )
-        self._wait_agent(self.stock_url)
+        self._wait_agent('stock', self.stock_url)
 
         self._spawn('sales', self._sales_args(), 'sales.log')
-        self._wait_agent(self.sales_url)
+        self._wait_agent('sales', self.sales_url)
 
-    def _wait_agent(self, url: str, timeout: float = 30.0) -> None:
+    def _wait_agent(self, name: str, url: str, timeout: float = 30.0) -> None:
         """Polls the agent card endpoint; sync so async callers can use it."""
         with httpx.Client(timeout=3) as http:
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
+                self._check_alive(name)
                 try:
                     response = http.get(
                         f'{url}/.well-known/agent-card.json'
@@ -152,14 +195,14 @@ class Stack:
                 except httpx.HTTPError:
                     pass
                 time.sleep(0.3)
-        raise TimeoutError(f'agent card at {url} never came up')
+        self._raise_startup(name, f'agent card at {url} never came up')
 
     def restart_sales(self, extra_args: list[str] | None = None) -> None:
         self.start_sales(self._sales_args(extra_args))
 
     def start_sales(self, args: list[str]) -> None:
         self._spawn('sales', args, 'sales.log')
-        self._wait_agent(self.sales_url)
+        self._wait_agent('sales', self.sales_url)
 
     def kill_agent(self, name: str) -> None:
         proc = self._processes.get(name)
