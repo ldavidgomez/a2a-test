@@ -5,8 +5,17 @@ A minimal [A2A](https://a2a-protocol.org/) server built on the official **`a2a-s
 | File | What it holds |
 | --- | --- |
 | [`agent_executor.py`](agent_executor.py) | The executors: `EchoAgentExecutor`, `OllamaAgentExecutor`, `DelegatingAgentExecutor` (an A2A client inside an agent) and `ClaudeAgentExecutor` |
-| [`server.py`](server.py) | Agent Card + `DefaultRequestHandler` + `InMemoryTaskStore` + JSON-RPC routes on Starlette, served with Uvicorn. One process = one agent |
+| [`server.py`](server.py) | Agent Card + `DefaultRequestHandler` + JSON-RPC routes on Starlette, served with Uvicorn. One process = one agent |
 | [`client_test.py`](client_test.py) | Test client: resolves the Agent Card and sends a message |
+| [`shop_mcp.py`](shop_mcp.py) | MCP server for the purchase PoC: inventory, atomic + idempotent reservations, orders (SQLite) |
+| [`shop_executors.py`](shop_executors.py) | Purchase PoC executors: `SalesAgentExecutor` (conversation + saga) and `StockAgentExecutor` (A2A→MCP bridge) |
+| [`shop_state.py`](shop_state.py) | Durable per-context sales sessions (SQLite) |
+| [`shop_client.py`](shop_client.py) | Shared clients: MCP tool calls + A2A send/tasks-get with structured data parts |
+| [`client_purchase.py`](client_purchase.py) | Conversational client for the purchase workflow |
+| [`shop_stack.py`](shop_stack.py) | Process orchestration (binds MCP + stock + sales) |
+| [`demo_purchase.py`](demo_purchase.py) | One-shot demo: happy path, restart drill, atomicity & idempotency tests |
+| [`test_concurrency.py`](test_concurrency.py) | PASS/FAIL test: N concurrent buyers for the last unit |
+| [`test_idempotency.py`](test_idempotency.py) | PASS/FAIL test: repeated reservation/order requests |
 
 > **About the SDK version:** in `a2a-sdk` 1.x the types (`AgentCard`, `Message`, `Part`, …) are **protobuf messages**, not Pydantic models, and the app is no longer assembled with `A2AStarletteApplication`: you compose routes (`create_agent_card_routes` + `create_jsonrpc_routes`) into a Starlette app. This repo targets the 1.2.2 API.
 
@@ -125,15 +134,23 @@ Notes when both agents share one Ollama:
 | Option | Default | What it does |
 | --- | --- | --- |
 | `--host` / `--port` | `127.0.0.1` / `9999` | Where it listens |
-| `--mode` | `echo` | `echo`, `ollama`, `delegate` or `claude` |
+| `--mode` | `echo` | `echo`, `ollama`, `delegate`, `claude`, `sales`, `stock` |
 | `--name` | `A2A <mode> agent` | Name in the Agent Card |
 | `--model` | per mode | LLM model (in `delegate`, the one used to summarise) |
 | `--system` | — | System prompt (`ollama` mode) |
-| `--peer` | — | Base URL of the agent to delegate to (required in `delegate`) |
+| `--peer` | — | Base URL of the agent to delegate to (required in `delegate`/`sales`) |
 | `--ollama-url` | `http://localhost:11434` | Where Ollama lives |
 | `--public-url` | `http://<host>:<port>` | URL published in the Agent Card (useful behind a proxy) |
+| `--mcp-url` | `http://127.0.0.1:9996` | Shop MCP server (used by `sales`/`stock`) |
+| `--task-db` | `data/tasks_<mode>.db` ¹ | A2A task store: SQLite for `sales`/`stock`, in memory otherwise |
+| `--sales-db` | `data/sales.db` | Durable sales sessions (`sales` mode) |
+| `--llm` | `glm` if `GLM_API_KEY` set | `glm` (GLM-5-3 decorates answers, needs `GLM_API_KEY`), `ollama` (local model) or `none` (deterministic templates) |
+| `--pause-after` | — | Crash drill: `reserve` = sleep between reservation and order |
+| `--reset` | — | Delete the task/session DB files before starting |
 
-Every option has an equivalent environment variable: `A2A_HOST`, `A2A_PORT`, `AGENT_MODE`, `OLLAMA_URL`, `A2A_PEER_URL`, `A2A_PUBLIC_URL`.
+¹ only `sales`/`stock` persist by default; other modes keep tasks in memory unless `--task-db` is given.
+
+Every option has an equivalent environment variable: `A2A_HOST`, `A2A_PORT`, `AGENT_MODE`, `OLLAMA_URL`, `A2A_PEER_URL`, `A2A_PUBLIC_URL`, `MCP_URL`, `A2A_TASK_DB`, `A2A_SALES_DB`, `AGENT_LLM`, `A2A_PAUSE_AFTER`.
 
 ## Endpoints
 
@@ -157,6 +174,127 @@ $env:ANTHROPIC_API_KEY = "sk-ant-..."
 
 It uses `claude-opus-5-5` with `effort: low` and the server-side fallback enabled. **Not tested on this machine** (no key configured).
 
+## 4. The keyboard purchase workflow (A2A + MCP + saga)
+
+The full PoC from the purchase diagram: three processes and a client.
+
+```text
+client_purchase.py ──A2A──▶  Agente de Ventas (:9999)
+                             ├─ delega búsqueda y reserva ──A2A──▶  Agente de Stock (:9998)
+                             └─ crea pedidos ────────MCP──▶  Tienda MCP (:9996)
+                                                             └── data/shop.db (SQLite WAL)
+```
+
+What it demonstrates (mapa con los pasos del workflow):
+
+1. The client asks ventas for a keyboard (Spanish mini-grammar: `busco …`,
+   `elijo 2`, `comprar`, `estado`…).
+2. Ventas delegates the search to stock over **real A2A** (`message/send`,
+   its own Agent Card resolution, one task per request).
+3. Stock queries the inventory through **MCP** (`search_stock` over
+   streamable HTTP).
+4. Ventas proposes products and parks the task in **`input-required`**;
+   the client answers with `taskId` and **the same task** continues.
+5. The purchase is one long task: reserva via A2A (stock → MCP
+   `reserve_stock`) **then** pedido via MCP directly (`create_order`).
+6. **Atomicity & idempotency live in the SQLite layer**: the stock update
+   and the reservation/order inserts run in `BEGIN IMMEDIATE`
+   transactions and are deduplicated by `UNIQUE(idempotency_key)` columns
+   (keys derive from the A2A context, so retries at any layer collapse:
+   client → ventas → stock → MCP).
+7. **Durability across crashes**: ventas keeps sessions in `data/sales.db`
+   and both agents keep A2A tasks in `DatabaseTaskStore` (SQLite). Kill
+   ventas between reservation and order (`--pause-after reserve` is the
+   crash point), restart it: `tasks/get` still shows the interrupted task
+   as `WORKING`, and replying with its `taskId` (`continuar`)
+   **completes that same task** from durable state.
+
+Business rejections are **not** protocol errors: a buyer that loses the
+last-unit race gets a `COMPLETED` task with a rejection artifact
+(`SIN_STOCK`); only transport/agent errors set the task to `failed`.
+
+### One-shot demo
+
+```powershell
+# deterministic (no LLM): ventas uses plain templates
+.\.venv\Scripts\python.exe demo_purchase.py
+
+# with GLM-5-3 decorating the sales agent's answers
+$env:GLM_API_KEY = "..."
+.\.venv\Scripts\python.exe demo_purchase.py --llm glm
+
+# with a local Ollama model instead
+.\.venv\Scripts\python.exe demo_purchase.py --llm ollama
+```
+
+It runs three acts — happy path, crash/restart drill and the two critical
+tests — with `[PASS]`/`[FAIL]` verdicts and a summary. All process logs go
+to `data/logs/`. The LLM only rewrites deterministic templates (codes,
+prices and IDs may not change); if it is unreachable the templates are used
+and the demo still passes, so the tests are reproducible.
+
+### Manual run (three windows + client)
+
+```powershell
+# 1) MCP shop server (:9996)
+.\.venv\Scripts\python.exe shop_mcp.py
+
+# 2) stock agent (:9998, tasks in data/tasks_stock.db)
+.\.venv\Scripts\python.exe server.py --mode stock --port 9998 --name "Agente de Stock"
+
+# 3) sales agent (:9999, sessions in data/sales.db)
+.\.venv\Scripts\python.exe server.py --mode sales --peer http://127.0.0.1:9998 `
+  --name "Agente de Ventas" [--llm glm|ollama|none]
+
+# 4) talk to the sales agent
+.\.venv\Scripts\python.exe client_purchase.py "busco un teclado"
+.\.venv\Scripts\python.exe client_purchase.py --task <taskId> --context <contextId> "elijo 1"
+.\.venv\Scripts\python.exe client_purchase.py --context <contextId> "comprar"
+.\.venv\Scripts\python.exe client_purchase.py --context <contextId> "estado"
+```
+
+The search task stays in `input-required` until the client replies with
+that `taskId` (A2A's mid-task input flow). `--get-task <id>` dumps a stored
+task; `--interactive` opens a small REPL (also usable without args).
+
+### The two critical tests
+
+```powershell
+# each boots its own fresh stack; --no-boot to reuse a running one
+.\.venv\Scripts\python.exe test_concurrency.py      # last unit, 8 buyers
+.\.venv\Scripts\python.exe test_idempotency.py     # repeated requests
+```
+
+- `test_concurrency`: seeds `KD-LAST-03` with **1 unit**, runs 8 buyer
+  sessions and fires all purchases at once → exactly one confirmed order,
+  seven `SIN_STOCK` rejections whose tasks are `COMPLETED` (never
+  `failed`), one new reservation/order row in the DB and stock 0 (never
+  negative).
+- `test_idempotency`: (A) repeating «comprar» returns the same order with
+  no DB change; (B) the same `reserve_stock` call twice returns the same
+  reservation and decrements stock once; (C) `create_order` twice with the
+  same key returns the same order, while a different key over a consumed
+  reservation is rejected (`RESERVA_YA_CONSUMIDA`).
+
+### Restart drill by hand
+
+1. Start the stack, then relaunch ventas with `--pause-after reserve`.
+2. `buscar` → `elijo` → `comprar`: after `Reserva … confirmada` the task
+   falls asleep between reservation and order — **kill the process** in
+   that window.
+3. Relaunch ventas normally (leave `data/` intact). The startup recovery
+   pass logs the pending purchase it finds.
+4. `client_purchase.py --get-task <taskId>` → the interrupted task is
+   still `WORKING` (persisted in SQLite).
+5. `client_purchase.py --task <taskId> --context <contextId> "continuar"`
+   → the SAME task completes with the order: the saga resumes from
+   `sales.db` + `shop.db` — no double reservation, because the order
+   reuses the persisted idempotency key.
+
+Reservations expire after 90 s (`DEFAULT_RESERVATION_TTL_SECONDS`), so a
+recovered-but-expired attempt is rejected with `RESERVA_CADUCADA` and the
+next `comprar` starts a new attempt with a fresh idempotency key.
+
 ## How the pieces fit
 
 1. The client fetches `/.well-known/agent-card.json` and picks the transport (JSON-RPC here) from `supportedInterfaces`.
@@ -167,7 +305,9 @@ It uses `claude-opus-5-5` with `effort: low` and the server-side fallback enable
 
 ## Next steps
 
-- Real streaming: emit several `TaskStatusUpdateEvent` / artifacts as work progresses (today the answer arrives in one piece at the end).
-- An `input-required` flow to ask the user for data mid-task.
+- ~~Real streaming~~ — the purchase workflow emits intermediate `TaskStatusUpdateEvent` messages (`Consultando el stock…`, `Reserva confirmada…`) via `update_status`, plus artifacts as work progresses.
+- ~~An `input-required` flow~~ — used in the purchase workflow for the product selection.
 - Authentication: `security_schemes` in the Agent Card + client interceptors (`a2a.client.auth`).
-- More than two agents: `DelegatingAgentExecutor` takes a single `--peer`; for a router with several peers, keep one client per URL and choose by the skill each Agent Card advertises.
+- More than two agents: `DelegatingAgentExecutor` and `SalesAgentExecutor` take a single `--peer`; for a router with several peers, keep one client per URL and choose by the skill each Agent Card advertises.
+- Multi-cantidad / multi-item carts: `qty` is fixed at 1 per purchase in this PoC.
+- Push notifications (`TaskPushNotificationConfig`) so ventas can finish recovered orders without waiting for the client's `continuar`.

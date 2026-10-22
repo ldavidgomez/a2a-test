@@ -52,3 +52,7 @@ $RECYCLE.BIN/
 .Spotlight-V100
 .Trashes
 .fseventsd
+
+# --- Purchase-workflow demo ---
+# SQLite/task/session state and stack logs (recreated by demo_purchase.py)
+data/

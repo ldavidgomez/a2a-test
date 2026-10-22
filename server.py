@@ -8,6 +8,7 @@ two instances on different ports and point the second one at the first with
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 
 from collections.abc import AsyncIterator
@@ -19,7 +20,7 @@ from starlette.applications import Starlette
 
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
-from a2a.server.tasks import InMemoryTaskStore
+from a2a.server.tasks import DatabaseTaskStore, InMemoryTaskStore
 from a2a.types import (
     AgentCapabilities,
     AgentCard,
@@ -37,8 +38,12 @@ from agent_executor import (
     DelegatingAgentExecutor,
     EchoAgentExecutor,
     OllamaAgentExecutor,
-    ReplyExecutor,
 )
+from llm_client import PROVIDERS, build_llm_client
+from shop_executors import SalesAgentExecutor, StockAgentExecutor
+from shop_state import SalesSessionStore
+
+logger = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         '--mode',
-        choices=['echo', 'ollama', 'delegate', 'claude'],
+        choices=['echo', 'ollama', 'delegate', 'claude', 'sales', 'stock'],
         default=os.getenv('AGENT_MODE', 'echo'),
         help='What the agent does with the message it receives.',
     )
@@ -70,17 +75,61 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--peer',
         default=os.getenv('A2A_PEER_URL'),
-        help='Base URL of the A2A agent to delegate to (delegate mode).',
+        help='Base URL of the A2A agent to delegate to (delegate/sales modes).',
     )
     parser.add_argument(
         '--public-url',
         default=os.getenv('A2A_PUBLIC_URL'),
         help='URL published in the Agent Card (useful behind a proxy).',
     )
+    # --- purchase workflow (sales / stock) -----------------------------
+    parser.add_argument(
+        '--mcp-url',
+        default=os.getenv('MCP_URL', 'http://127.0.0.1:9996'),
+        help='Base URL of the shop MCP server (sales/stock modes).',
+    )
+    parser.add_argument(
+        '--sales-db',
+        default=os.getenv('A2A_SALES_DB', os.path.join('data', 'sales.db')),
+        help='SQLite file for the sales sessions (sales mode).',
+    )
+    parser.add_argument(
+        '--task-db',
+        default=os.getenv('A2A_TASK_DB'),
+        help='SQLite file for the A2A task store. Default for sales/stock: '
+        'data/tasks_<mode>.db; other modes keep tasks in memory.',
+    )
+    parser.add_argument(
+        '--llm',
+        choices=PROVIDERS,
+        default=os.getenv(
+            'AGENT_LLM', 'glm' if os.getenv('GLM_API_KEY') else 'none'
+        ),
+        help='LLM that decorates the sales answers (glm | ollama | none).',
+    )
+    parser.add_argument(
+        '--llm-model', default=os.getenv('GLM_MODEL'),
+        help='Model name for the LLM (defaults: glm-5-3 / llama3.2).',
+    )
+    parser.add_argument(
+        '--llm-base-url', default=os.getenv('GLM_BASE_URL'),
+        help='OpenAI-compatible base URL (defaults per provider).',
+    )
+    parser.add_argument(
+        '--pause-after',
+        choices=['reserve'],
+        default=os.getenv('A2A_PAUSE_AFTER'),
+        help='Crash-drill checkpoint: sleep after the reservation is '
+        'confirmed, before creating the order (sales mode).',
+    )
+    parser.add_argument(
+        '--reset', action='store_true',
+        help='Delete task/session DB files before starting.',
+    )
     return parser.parse_args()
 
 
-def build_executor(args: argparse.Namespace) -> ReplyExecutor:
+def build_executor(args: argparse.Namespace):
     if args.mode == 'echo':
         return EchoAgentExecutor()
 
@@ -93,6 +142,29 @@ def build_executor(args: argparse.Namespace) -> ReplyExecutor:
 
     if args.mode == 'claude':
         return ClaudeAgentExecutor(model=args.model or DEFAULT_CLAUDE_MODEL)
+
+    if args.mode == 'stock':
+        return StockAgentExecutor(mcp_url=args.mcp_url)
+
+    if args.mode == 'sales':
+        if not args.peer:
+            raise SystemExit('sales mode needs --peer http://host:port '
+                             '(the stock agent URL)')
+        llm = build_llm_client(
+            args.llm,
+            model=args.llm_model,
+            base_url=args.llm_base_url,
+            ollama_url=args.ollama_url,
+        )
+        sessions = SalesSessionStore(args.sales_db)
+        executor = SalesAgentExecutor(
+            peer_url=args.peer,
+            mcp_url=args.mcp_url,
+            sessions=sessions,
+            llm=llm,
+            pause_after=args.pause_after,
+        )
+        return executor
 
     if not args.peer:
         raise SystemExit('delegate mode needs --peer http://host:port')
@@ -113,6 +185,10 @@ def build_agent_card(args: argparse.Namespace, public_url: str) -> AgentCard:
         'ollama': f'Answers with the local model {args.model or DEFAULT_OLLAMA_MODEL} (Ollama).',
         'claude': f'Answers with {args.model or DEFAULT_CLAUDE_MODEL} (Claude API).',
         'delegate': f'Delegates the question to the A2A agent at {args.peer}.',
+        'sales': 'Shop sales agent: proposes keyboards, reserves via the '
+                 'stock agent (A2A) and creates the order (MCP).',
+        'stock': 'Stock agent: queries inventory and reserves units '
+                 'through the shop MCP server.',
     }
     skills = {
         'echo': AgentSkill(
@@ -143,6 +219,22 @@ def build_agent_card(args: argparse.Namespace, public_url: str) -> AgentCard:
             tags=['a2a', 'orchestration'],
             examples=['Ask your peer what an Agent Card is.'],
         ),
+        'sales': AgentSkill(
+            id='purchase',
+            name='Keyboard purchase assistant',
+            description='Client-facing purchase workflow: search, selection '
+                        '(input-required), reservation and order.',
+            tags=['a2a', 'mcp', 'saga', 'purchase'],
+            examples=['Busco un teclado mecánico', 'elijo 1', 'comprar'],
+        ),
+        'stock': AgentSkill(
+            id='inventory',
+            name='Inventory and reservations',
+            description='Searches products and reserves stock units '
+                        'through MCP with atomic, idempotent semantics.',
+            tags=['a2a', 'mcp', 'stock'],
+            examples=['{"action": "search", "query": "tkl"}'],
+        ),
     }
 
     return AgentCard(
@@ -163,14 +255,40 @@ def build_agent_card(args: argparse.Namespace, public_url: str) -> AgentCard:
     )
 
 
+def _default_task_db(args: argparse.Namespace) -> str | None:
+    """sales/stock persist tasks by default (they must survive a restart)."""
+    if args.task_db:
+        return args.task_db
+    if args.mode in ('sales', 'stock'):
+        return os.path.join('data', f'tasks_{args.mode}.db')
+    return None
+
+
+def build_task_store(args: argparse.Namespace):
+    """InMemory by default; DatabaseTaskStore (SQLite) for sales/stock."""
+    task_db = _default_task_db(args)
+    if not task_db:
+        return InMemoryTaskStore(), None
+
+    task_db = task_db.replace('\\', '/')
+    directory = os.path.dirname(task_db)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    engine = create_async_engine(f'sqlite+aiosqlite:///{task_db}')
+    return DatabaseTaskStore(engine=engine), task_db
+
+
 def build_app(args: argparse.Namespace) -> Starlette:
     public_url = args.public_url or f'http://{args.host}:{args.port}'
     agent_card = build_agent_card(args, public_url)
     executor = build_executor(args)
+    task_store, task_db = build_task_store(args)
 
     request_handler = DefaultRequestHandler(
         agent_executor=executor,
-        task_store=InMemoryTaskStore(),
+        task_store=task_store,
         agent_card=agent_card,
     )
 
@@ -182,6 +300,12 @@ def build_app(args: argparse.Namespace) -> Starlette:
     # Starlette 1.x only takes lifespan (no more on_startup/on_shutdown).
     @asynccontextmanager
     async def lifespan(_app: Starlette) -> AsyncIterator[None]:
+        if task_db:
+            await task_store.initialize()
+            logger.info('[%s] task store ready at %s', args.mode, task_db)
+        startup = getattr(executor, 'startup', None)
+        if startup is not None:
+            await startup()  # recovery pass (sales)
         try:
             yield
         finally:
@@ -191,7 +315,24 @@ def build_app(args: argparse.Namespace) -> Starlette:
 
 
 if __name__ == '__main__':
+    logging.basicConfig(
+        level=os.getenv('LOG_LEVEL', 'INFO').upper(),
+        format='[%(name)s] %(asctime)s %(levelname)s %(message)s',
+    )
     arguments = parse_args()
+
+    if arguments.reset:
+        for path in filter(None, (arguments.sales_db,
+                                  _default_task_db(arguments))):
+            for suffix in ('', '-wal', '-shm'):
+                try:
+                    os.remove(path + suffix)
+                    print(f'[reset] deleted {path + suffix}')
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:  # e.g. held by another process
+                    print(f'[reset] could not delete {path + suffix}: {exc}')
+
     uvicorn.run(
         build_app(arguments), host=arguments.host, port=arguments.port
     )

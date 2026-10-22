@@ -1,11 +1,14 @@
-# Official A2A SDK (the http-server extra pulls in Starlette + sse-starlette)
-a2a-sdk[http-server]>=1.2.2,<2
+# Official A2A SDK: http-server (Starlette routes) + sql (DatabaseTaskStore)
+a2a-sdk[http-server,sql]>=1.2.2,<2
 
 # ASGI server
 uvicorn>=0.34,<1
 
-# HTTP client used to talk to Ollama (a2a-sdk ships it; declared as a direct use)
+# HTTP client used to talk to Ollama/GLM (a2a-sdk ships it; declared as a direct use)
 httpx>=0.28,<1
+
+# MCP server/client for the purchase workflow (inventory + orders)
+mcp>=1.30,<2
 
 # Optional: only needed for --mode claude
 anthropic>=1.15,<2
