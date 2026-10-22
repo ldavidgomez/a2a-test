@@ -1,13 +1,35 @@
-"""LLM clients for the sales agent (decoration only, never decisions).
+"""LLM configuration for the sales agent (decoration only, never decisions).
 
-Both providers speak the OpenAI-compatible ``POST /chat/completions`` API:
+Three interchangeable sources, all speaking the same OpenAI-compatible
+``POST /chat/completions`` API:
 
-- ``glm``   -> GLM-5-3 over HTTP with an API key (env: ``GLM_API_KEY``,
-  ``GLM_MODEL`` default ``glm-5-3``, ``GLM_BASE_URL`` default the z.ai
-  endpoint; switch to Zhipu by pointing ``GLM_BASE_URL`` at
-  ``https://open.bigmodel.cn/api/paas/v4``).
-- ``ollama`` -> a local model through Ollama's OpenAI-compatible endpoint
-  (``OLLAMA_URL``, default ``http://localhost:11434/v1``).
+1. **Built-ins**: ``glm`` (env ``GLM_API_KEY``/``GLM_MODEL``/``GLM_BASE_URL``,
+   default endpoint api.z.ai) and ``ollama`` (local OpenAI-compatible
+   endpoint, model ``llama3.2``). No extra setup needed.
+2. **A providers file** (default ``llm_config.json``, overridable with
+   ``--llm-config`` / env ``A2A_LLM_CONFIG``)::
+
+       {
+         "default": "glm",
+         "providers": {
+           "glm":       {"base_url": "https://api.z.ai/api/paas/v4",
+                          "model": "glm-5-3", "api_key_env": "GLM_API_KEY"},
+           "glm-zhipu": {"base_url": "https://open.bigmodel.cn/api/paas/v4",
+                          "model": "glm-5-3", "api_key_env": "ZHIPU_API_KEY"},
+           "ollama":    {"base_url": "http://localhost:11434/v1",
+                          "model": "llama3.2"}
+         }
+       }
+
+   Every entry needs ``base_url`` and ``model``; the API key comes either
+   from an inline ``api_key`` (avoid committing it) or from the env var
+   named in ``api_key_env``. Entries are selected by name with
+   ``--llm <name>``; the file's ``default`` is used when nothing else
+   says otherwise. Any OpenAI-compatible endpoint works (the file is the
+   place to add custom/local ones). See ``llm_config.example.json``.
+3. **CLI overrides**: ``--llm-model`` / ``--llm-base-url`` win over the
+   entry; env ``AGENT_LLM`` wins over the file's ``default``; an explicit
+   ``--llm`` wins over everything.
 
 Design rule of the PoC: the LLM only *rewrites* deterministic answer
 templates for the client. Intents, reservations and orders are parsed and
@@ -18,18 +40,19 @@ template text is returned verbatim.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_CONFIG_FILE = 'llm_config.json'
 DEFAULT_GLM_BASE_URL = 'https://api.z.ai/api/paas/v4'
 DEFAULT_GLM_MODEL = 'glm-5-3'
 DEFAULT_OLLAMA_MODEL = 'llama3.2'
 REQUEST_TIMEOUT = 60.0
-
-PROVIDERS = ('glm', 'ollama', 'none')
 
 
 class LlmError(RuntimeError):
@@ -44,6 +67,147 @@ def _clean_base_url(url: str) -> str:
     return url
 
 
+# ----------------------------------------------------------------------
+# providers file
+# ----------------------------------------------------------------------
+def load_config(path: str | None) -> dict:
+    """Reads the providers JSON. Missing file -> {}; malformed -> ValueError.
+
+    Accepted shape: ``{"default": "<name>", "providers": {name: entry}}``
+    plus optional extra keys (kept for forward compatibility).
+    """
+    if not path:
+        return {}
+    try:
+        with open(path, encoding='utf-8') as handle:
+            config = json.load(handle)
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as exc:
+        raise ValueError(f'fichero de proveedores inválido ({path}): {exc}') from exc
+
+    if not isinstance(config, dict):
+        raise ValueError(f'fichero de proveedores inválido ({path}): se esperaba un objeto JSON')
+
+    providers = config.get('providers', {})
+    if not isinstance(providers, dict) or not all(
+        isinstance(entry, dict) for entry in providers.values()
+    ):
+        raise ValueError(
+            f'"providers" de {path} debe ser un objeto cuyos valores sean objetos'
+        )
+    return config
+
+
+def resolve_provider_name(explicit: str | None, config: dict) -> str:
+    """Precedence: explicit --llm > env AGENT_LLM > file default > heuristic."""
+    if explicit:
+        return explicit.strip()
+    env_choice = os.getenv('AGENT_LLM')
+    if env_choice:
+        return env_choice.strip()
+    if config.get('default'):
+        return str(config['default'])
+    return 'glm' if os.getenv('GLM_API_KEY') else 'none'
+
+
+def _from_entry(
+    name: str, entry: dict, config_path: str | None,
+    model: str | None, base_url: str | None, api_key: str | None,
+) -> LlmClient | None:
+    """Builds a client from one ``providers`` entry, applying CLI overrides.
+
+    If the entry declares ``api_key_env`` and that variable is not set
+    (and no inline key/override exists), the provider is treated as
+    unavailable: ``None`` is returned and the deterministic templates
+    take over — same rule as the built-in ``glm``.
+    """
+    resolved_model = model or entry.get('model')
+    resolved_base = base_url or entry.get('base_url')
+    if not resolved_model or not resolved_base:
+        raise ValueError(
+            f'el proveedor "{name}" del fichero de proveedores necesita '
+            f'"model" y "base_url" (o pásalos con --llm-model/--llm-base-url)'
+        )
+    resolved_key = api_key or entry.get('api_key')
+    key_env = entry.get('api_key_env')
+    if key_env:
+        resolved_key = resolved_key or os.getenv(key_env)
+        if not resolved_key:
+            logger.warning(
+                'proveedor "%s": la variable %s no está definida; el '
+                'proveedor queda deshabilitado (plantillas deterministas)',
+                name, key_env,
+            )
+            return None
+    return LlmClient(
+        provider=name,
+        model=str(resolved_model),
+        base_url=str(resolved_base),
+        api_key=resolved_key,
+    )
+
+
+def build_llm_client(
+    provider: str | None,
+    model: str | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    config_path: str | None = None,
+    ollama_url: str = 'http://localhost:11434',
+) -> LlmClient | None:
+    """Factory used by ``server.py`` for modes that want an LLM.
+
+    Returns ``None`` for ``none``, and raises ``ValueError`` for unknown
+    names (listing what is available). An empty ``provider`` resolves
+    through :func:`resolve_provider_name`.
+    """
+    config = load_config(config_path)
+    name = (provider or '').strip()
+    if not name:
+        name = resolve_provider_name(None, config)
+    if name == 'none':
+        return None
+
+    entry = (config.get('providers') or {}).get(name)
+    if entry is not None:
+        return _from_entry(name, entry, config_path, model, base_url, api_key)
+
+    if name == 'glm':
+        key = api_key or os.getenv('GLM_API_KEY')
+        if not key:
+            logger.warning(
+                'LLM "glm" requested but GLM_API_KEY is not set; '
+                'the sales agent will use deterministic templates.'
+            )
+            return None
+        return LlmClient(
+            provider='glm',
+            model=model or os.getenv('GLM_MODEL', DEFAULT_GLM_MODEL),
+            base_url=base_url or os.getenv('GLM_BASE_URL', DEFAULT_GLM_BASE_URL),
+            api_key=key,
+        )
+
+    if name == 'ollama':
+        return LlmClient(
+            provider='ollama',
+            model=model or DEFAULT_OLLAMA_MODEL,
+            base_url=base_url or f'{ollama_url.rstrip("/")}/v1',
+        )
+
+    available = list(dict.fromkeys(
+        ['none', 'glm', 'ollama']
+        + sorted((config.get('providers') or {}).keys())
+    ))
+    raise ValueError(
+        f'proveedor LLM desconocido "{name}". Disponibles: '
+        f'{", ".join(available)}'
+    )
+
+
+# ----------------------------------------------------------------------
+# OpenAI-compatible chat completions
+# ----------------------------------------------------------------------
 class LlmClient:
     """Minimal OpenAI-compatible chat-completions client."""
 
@@ -96,48 +260,3 @@ class LlmClient:
 
     async def aclose(self) -> None:
         await self._http.aclose()
-
-
-def build_llm_client(
-    provider: str | None,
-    model: str | None = None,
-    base_url: str | None = None,
-    api_key: str | None = None,
-    ollama_url: str = 'http://localhost:11434',
-) -> LlmClient | None:
-    """Factory used by ``server.py`` for modes that want an LLM.
-
-    Returns ``None`` for ``none``/empty providers, or when ``glm`` is
-    requested without an API key (a warning is logged and the agent falls
-    back to deterministic templates).
-    """
-    if provider in (None, '', 'none'):
-        return None
-
-    if provider == 'glm':
-        import os
-
-        key = api_key or os.getenv('GLM_API_KEY')
-        if not key:
-            logger.warning(
-                'LLM "glm" requested but GLM_API_KEY is not set; '
-                'the sales agent will use deterministic templates.'
-            )
-            return None
-        return LlmClient(
-            provider='glm',
-            model=model or os.getenv('GLM_MODEL', DEFAULT_GLM_MODEL),
-            base_url=base_url or os.getenv('GLM_BASE_URL', DEFAULT_GLM_BASE_URL),
-            api_key=key,
-        )
-
-    if provider == 'ollama':
-        return LlmClient(
-            provider='ollama',
-            model=model or DEFAULT_OLLAMA_MODEL,
-            base_url=base_url or f'{ollama_url.rstrip("/")}/v1',
-        )
-
-    raise ValueError(
-        f'Unknown LLM provider "{provider}". Use one of: {", ".join(PROVIDERS)}.'
-    )

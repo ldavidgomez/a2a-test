@@ -39,7 +39,7 @@ from agent_executor import (
     EchoAgentExecutor,
     OllamaAgentExecutor,
 )
-from llm_client import PROVIDERS, build_llm_client
+from llm_client import build_llm_client, load_config, resolve_provider_name
 from shop_executors import SalesAgentExecutor, StockAgentExecutor
 from shop_state import SalesSessionStore
 
@@ -101,11 +101,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         '--llm',
-        choices=PROVIDERS,
-        default=os.getenv(
-            'AGENT_LLM', 'glm' if os.getenv('GLM_API_KEY') else 'none'
-        ),
-        help='LLM that decorates the sales answers (glm | ollama | none).',
+        default=os.getenv('AGENT_LLM'),
+        help='LLM for the sales agent: none | glm | ollama | any name from '
+             'the providers file. Default chain: AGENT_LLM > the file\'s '
+             '"default" > glm if GLM_API_KEY set > none.',
     )
     parser.add_argument(
         '--llm-model', default=os.getenv('GLM_MODEL'),
@@ -114,6 +113,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--llm-base-url', default=os.getenv('GLM_BASE_URL'),
         help='OpenAI-compatible base URL (defaults per provider).',
+    )
+    parser.add_argument(
+        '--llm-config',
+        default=os.getenv('A2A_LLM_CONFIG', 'llm_config.json'),
+        help='JSON with a "providers" section naming extra LLM endpoints '
+             '(see llm_config.example.json).',
     )
     parser.add_argument(
         '--pause-after',
@@ -150,11 +155,22 @@ def build_executor(args: argparse.Namespace):
         if not args.peer:
             raise SystemExit('sales mode needs --peer http://host:port '
                              '(the stock agent URL)')
+        llm_config = load_config(args.llm_config)
+        provider_name = resolve_provider_name(args.llm, llm_config)
         llm = build_llm_client(
-            args.llm,
+            provider_name,
             model=args.llm_model,
             base_url=args.llm_base_url,
+            config_path=args.llm_config,
             ollama_url=args.ollama_url,
+        )
+        logger.info(
+            '[sales] LLM: %s',
+            'ninguno (plantillas deterministas)' if llm is None
+            else f'{llm.describe}'
+            + (f' [fichero: {args.llm_config}]'
+               if provider_name in (llm_config.get('providers') or {})
+               else ''),
         )
         sessions = SalesSessionStore(args.sales_db)
         executor = SalesAgentExecutor(

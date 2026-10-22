@@ -56,3 +56,6 @@ $RECYCLE.BIN/
 # --- Purchase-workflow demo ---
 # SQLite/task/session state and stack logs (recreated by demo_purchase.py)
 data/
+
+# LLM providers file: may contain inline API keys (copy from llm_config.example.json)
+llm_config.json

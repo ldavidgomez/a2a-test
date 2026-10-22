@@ -1,0 +1,23 @@
+{
+  "default": "glm",
+  "providers": {
+    "glm": {
+      "base_url": "https://api.z.ai/api/paas/v4",
+      "model": "glm-5-3",
+      "api_key_env": "GLM_API_KEY"
+    },
+    "glm-zhipu": {
+      "base_url": "https://open.bigmodel.cn/api/paas/v4",
+      "model": "glm-5-3",
+      "api_key_env": "ZHIPU_API_KEY"
+    },
+    "ollama": {
+      "base_url": "http://localhost:11434/v1",
+      "model": "llama3.2"
+    },
+    "ollama-qwen": {
+      "base_url": "http://localhost:11434/v1",
+      "model": "qwen3:8b"
+    }
+  }
+}

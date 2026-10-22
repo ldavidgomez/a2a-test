@@ -29,6 +29,7 @@ import os
 
 from shop_client import a2a_get_task, a2a_send, call_mcp_tool
 from shop_stack import Stack
+from llm_client import load_config, resolve_provider_name
 
 import test_concurrency
 import test_idempotency
@@ -177,23 +178,29 @@ async def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        '--llm', choices=('glm', 'ollama', 'none'), default=None,
-        help='LLM to decorate the sales answers. Default: glm if '
-             'GLM_API_KEY is set, else deterministic templates.',
+        '--llm', default=None,
+        help='none | glm | ollama | nombre de un proveedor del fichero. '
+             'Default: AGENT_LLM > "default" del fichero > glm si hay '
+             'GLM_API_KEY > none.',
     )
+    parser.add_argument('--llm-config', default='llm_config.json',
+                        help='fichero JSON con la sección "providers"')
     parser.add_argument('--acts', default='1,2,3',
                         help='comma-separated acts to run (default 1,2,3)')
     parser.add_argument('--keep-data', action='store_true',
                         help='do not wipe data/ before starting')
     args = parser.parse_args()
 
-    llm = args.llm or ('glm' if os.getenv('GLM_API_KEY') else 'none')
+    llm_config = load_config(args.llm_config)
+    llm = args.llm or resolve_provider_name(None, llm_config)
     acts = {part for part in args.acts.split(',') if part}
 
     print('PoC compra de teclados · A2A (ventas <-> stock) + MCP (tienda)')
-    print(f'LLM: {llm}')
+    print(f'LLM: {llm}' + (
+        f' (fichero {args.llm_config})'
+        if llm in (llm_config.get('providers') or {}) else ''))
 
-    stack = Stack(llm=llm, log_prefix='  ')
+    stack = Stack(llm=llm, llm_config=args.llm_config, log_prefix='  ')
     failures = 0
     try:
         banner('ARRANQUE · MCP (:9996) + stock (:9998) + ventas (:9999)')

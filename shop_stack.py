@@ -59,12 +59,14 @@ class Stack:
         stock_port: int = 9998,
         sales_port: int = 9999,
         llm: str = 'none',
+        llm_config: str | None = None,
         log_prefix: str = '',
     ) -> None:
         self.mcp_port = mcp_port
         self.stock_port = stock_port
         self.sales_port = sales_port
         self.llm = llm
+        self.llm_config = llm_config
         self.log_prefix = log_prefix
         self._processes: dict[str, subprocess.Popen] = {}
         self._log_files: list = []
@@ -102,6 +104,18 @@ class Stack:
               f'-> {log_path}')
         return proc
 
+    def _sales_args(self, extra: list[str] | None = None) -> list[str]:
+        args = [
+            'server.py', '--mode', 'sales', '--port', str(self.sales_port),
+            '--name', 'Agente de Ventas', '--peer', self.stock_url,
+            '--llm', str(self.llm),
+        ]
+        if self.llm_config:
+            args.extend(['--llm-config', self.llm_config])
+        if extra:
+            args.extend(extra)
+        return args
+
     def start(self, reset: bool = False) -> None:
         """Boots MCP + stock + sales. ``reset`` wipes ``data/`` first."""
         if reset:
@@ -121,13 +135,7 @@ class Stack:
         )
         self._wait_agent(self.stock_url)
 
-        self._spawn(
-            'sales',
-            ['server.py', '--mode', 'sales', '--port', str(self.sales_port),
-             '--name', 'Agente de Ventas', '--peer', self.stock_url,
-             '--llm', self.llm],
-            'sales.log',
-        )
+        self._spawn('sales', self._sales_args(), 'sales.log')
         self._wait_agent(self.sales_url)
 
     def _wait_agent(self, url: str, timeout: float = 30.0) -> None:
@@ -147,14 +155,7 @@ class Stack:
         raise TimeoutError(f'agent card at {url} never came up')
 
     def restart_sales(self, extra_args: list[str] | None = None) -> None:
-        args = [
-            'server.py', '--mode', 'sales', '--port', str(self.sales_port),
-            '--name', 'Agente de Ventas', '--peer', self.stock_url,
-            '--llm', self.llm,
-        ]
-        if extra_args:
-            args.extend(extra_args)
-        self.start_sales(args)
+        self.start_sales(self._sales_args(extra_args))
 
     def start_sales(self, args: list[str]) -> None:
         self._spawn('sales', args, 'sales.log')
